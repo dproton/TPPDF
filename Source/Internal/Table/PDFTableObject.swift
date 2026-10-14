@@ -353,13 +353,18 @@ class PDFTableObject: PDFRenderObject {
                 nextPageCells = shiftCellsBy(cells: nextPageCells, shiftValue: table.margin)
             }
 
+            // The room a later page leaves for rows, under the repeated header
+            let nextPageHeight = maxOffset - PDFCalculations.calculateTopMinimum(for: generator) - headerHeight - table.margin
             let filterResult = filterCellsOnPage(
                 for: generator, items: nextPageCells,
                 minOffset: minOffset, maxOffset: maxOffset,
+                nextPageHeight: nextPageHeight,
                 shouldSplitCellsOnPageBreak: table.shouldSplitCellsOnPageBreak
             )
             let onPageCells = filterResult.cells
             nextPageCells = filterResult.remainder
+            // Where this page's part of the table ends; above `maxOffset` when a split row breaks between lines
+            let pageBottom = filterResult.pageBottom
             // If none of the cells fit on the current page, the algorithm will try again on the next page
             // and if it occurs again, an error should be thrown
             if onPageCells.isEmpty && !firstPage, let firstInvalidCell = nextPageCells.first {
@@ -368,12 +373,14 @@ class PDFTableObject: PDFRenderObject {
 
             for item in onPageCells {
                 let cellFrame = item.frames.cell
+                // A split cell's outline covers only its part on this page, not the parts on other pages
+                let pageFrame = visibleFrame(of: cellFrame, minOffset: minOffset, maxOffset: pageBottom)
 
                 // Maintain pageStart and pageEnd
-                pageStart.x = min(cellFrame.minX, pageStart.x)
-                pageStart.y = min(cellFrame.minY, pageStart.y)
-                pageEnd.x = max(cellFrame.maxX, pageEnd.x)
-                pageEnd.y = max(cellFrame.maxY, pageEnd.y)
+                pageStart.x = min(pageFrame.minX, pageStart.x)
+                pageStart.y = min(pageFrame.minY, pageStart.y)
+                pageEnd.x = max(pageFrame.maxX, pageEnd.x)
+                pageEnd.y = max(pageFrame.maxY, pageEnd.y)
 
                 var cellElements = [PDFRenderObject]()
 
@@ -398,10 +405,10 @@ class PDFTableObject: PDFRenderObject {
                 let sliceObject = createSliceObject(frame: cellFrame,
                                                     elements: cellElements,
                                                     minOffset: minOffset,
-                                                    maxOffset: maxOffset)
+                                                    maxOffset: pageBottom)
                 result += try sliceObject.calculate(generator: generator, container: container)
             }
-            
+
             // Draw the table outline for the page
             let tableOutlineObject = PDFRectangleObject(lineStyle: table.style.outline, frame: CGRect(
                 x: pageStart.x - table.margin,
@@ -426,6 +433,8 @@ class PDFTableObject: PDFRenderObject {
         var cells: [PDFTableCalculatedCell]
         /// List of remaining cells on further pages
         var remainder: [PDFTableCalculatedCell]
+        /// Where the page's part of the table ends, at or above `maxOffset`
+        var pageBottom: CGFloat
     }
 
     /// Filters the given list of cells into the ones that fit on the current page, and all remainding cells, repositioned for the next page.
@@ -435,18 +444,23 @@ class PDFTableObject: PDFRenderObject {
     ///   - items: List of cells to filter
     ///   - minOffset: Minimum `y`-position on the page
     ///   - maxOffset: Maximum `y`-position on the page
-    ///   - shouldSplitCellsOnPageBreak: If `true`, cells won't be sliced and shown on both pages, instead moved entirely to the next page
+    ///   - nextPageHeight: The room a later page leaves for rows
+    ///   - shouldSplitCellsOnPageBreak: If `true`, a row taller than a page is sliced across pages; see `splitCellsOnPage`
     /// - Returns: Two lists of cells, see `FilteredCells`
     func filterCellsOnPage(
         for _: PDFGenerator,
         items: [PDFTableCalculatedCell],
         minOffset: CGFloat,
         maxOffset: CGFloat,
+        nextPageHeight: CGFloat,
         shouldSplitCellsOnPageBreak: Bool
     ) -> FilteredCells {
+        if shouldSplitCellsOnPageBreak {
+            return splitCellsOnPage(items: items, minOffset: minOffset, maxOffset: maxOffset, nextPageHeight: nextPageHeight)
+        }
         // Maximum height available
         let contentHeight = maxOffset - minOffset
-        var result = FilteredCells(cells: [], remainder: [])
+        var result = FilteredCells(cells: [], remainder: [], pageBottom: maxOffset)
 
         var offsetFix: CGFloat!
 
@@ -480,6 +494,109 @@ class PDFTableObject: PDFRenderObject {
         return result
     }
 
+    /// Split mode's page break. The page ends above the row reaching past `maxOffset` when that row fits a later
+    /// page, so it moves whole; a row taller than that breaks between two text lines, so no line is cut through.
+    /// Every remaining cell moves up by the part of the table shown on this page.
+    func splitCellsOnPage(
+        items: [PDFTableCalculatedCell],
+        minOffset: CGFloat,
+        maxOffset: CGFloat,
+        nextPageHeight: CGFloat
+    ) -> FilteredCells {
+        let pageBottom = splitPageBottom(items: items, minOffset: minOffset, maxOffset: maxOffset, nextPageHeight: nextPageHeight)
+        var result = FilteredCells(cells: [], remainder: [], pageBottom: pageBottom)
+        for item in items {
+            let cellFrame = item.frames.cell
+            if cellFrame.minY < pageBottom {
+                result.cells.append(item)
+            }
+            if cellFrame.minY >= pageBottom || cellFrame.maxY > pageBottom {
+                var nextPageCell = item
+                nextPageCell.frames.cell.origin.y -= pageBottom - minOffset
+                nextPageCell.frames.content.origin.y -= pageBottom - minOffset
+                result.remainder.append(nextPageCell)
+            }
+        }
+        return result
+    }
+
+    /// Where split mode ends the page. `maxOffset` when no row reaches past it. The top of the row reaching
+    /// past it when the row fits a later page, or when none of its lines fits here; the row then moves whole, unless
+    /// nothing of the table is above it on this page. Otherwise the gap after the row's last line that fits.
+    func splitPageBottom(
+        items: [PDFTableCalculatedCell],
+        minOffset: CGFloat,
+        maxOffset: CGFloat,
+        nextPageHeight: CGFloat
+    ) -> CGFloat {
+        let crossing = items.filter { $0.frames.cell.minY < maxOffset && $0.frames.cell.maxY > maxOffset }
+        guard let rowTop = crossing.map(\.frames.cell.minY).min(),
+              let rowBottom = crossing.map(\.frames.cell.maxY).max() else {
+            return maxOffset
+        }
+        let canMoveWhole = items.contains { $0.frames.cell.maxY > minOffset && $0.frames.cell.maxY <= rowTop }
+        if canMoveWhole && rowBottom - rowTop <= nextPageHeight {
+            return rowTop
+        }
+        let lines = crossing.flatMap { textLineFrames(of: $0) }
+        // Moving the break above one cell's line can put it inside another cell's line, so repeat until it settles
+        var pageBottom = maxOffset
+        var previousBottom: CGFloat
+        repeat {
+            previousBottom = pageBottom
+            for line in lines where line.minY < pageBottom && line.maxY > pageBottom {
+                pageBottom = line.minY
+            }
+        } while pageBottom < previousBottom
+        let showsALine = lines.contains { $0.maxY > minOffset && $0.maxY <= pageBottom }
+        if showsALine {
+            return pageBottom
+        }
+        // A line taller than a page can't break between lines; slicing it at `maxOffset` keeps the table going
+        return canMoveWhole ? rowTop : maxOffset
+    }
+
+    /// The page frames of the text lines in `cell`, laid out as `PDFAttributedTextObject` draws them. Each
+    /// frame reaches halfway to the next line, or to the content frame's edge, so a break between two frames clears
+    /// glyphs that rise above the font's ascent.
+    func textLineFrames(of cell: PDFTableCalculatedCell) -> [CGRect] {
+        guard let content = cell.cell.content,
+              let text = getAttributedStringOfTable(content: content, style: cell.style, alignment: cell.cell.alignment) else {
+            return []
+        }
+        let contentFrame = cell.frames.content
+        let framesetter = CTFramesetterCreateWithAttributedString(text)
+        let path = CGPath(rect: CGRect(origin: .zero, size: contentFrame.size), transform: nil)
+        let frame = CTFramesetterCreateFrame(framesetter, CFRange(location: 0, length: text.length), path, nil)
+        guard let lines = CTFrameGetLines(frame) as? [CTLine], !lines.isEmpty else {
+            return []
+        }
+        var origins = [CGPoint](repeating: .zero, count: lines.count)
+        CTFrameGetLineOrigins(frame, CFRange(location: 0, length: 0), &origins)
+        // Core Text puts the origins bottom up from the frame's bottom edge; the page runs top down
+        let glyphSpans: [(top: CGFloat, bottom: CGFloat)] = zip(lines, origins).map { line, origin in
+            var ascent: CGFloat = 0
+            var descent: CGFloat = 0
+            var leading: CGFloat = 0
+            CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
+            let baseline = contentFrame.maxY - origin.y
+            return (baseline - ascent, baseline + descent)
+        }
+        return glyphSpans.indices.map { index in
+            let top = index > 0 ? (glyphSpans[index - 1].bottom + glyphSpans[index].top) / 2 : contentFrame.minY
+            let isLast = index == glyphSpans.count - 1
+            let bottom = isLast ? contentFrame.maxY : (glyphSpans[index].bottom + glyphSpans[index + 1].top) / 2
+            return CGRect(x: contentFrame.minX, y: top, width: contentFrame.width, height: bottom - top)
+        }
+    }
+
+    /// The part of `frame` between `minOffset` and `maxOffset`, empty at `minOffset` when they don't overlap.
+    func visibleFrame(of frame: CGRect, minOffset: CGFloat, maxOffset: CGFloat) -> CGRect {
+        let top = max(frame.minY, minOffset)
+        let bottom = max(min(frame.maxY, maxOffset), top)
+        return CGRect(x: frame.minX, y: top, width: frame.width, height: bottom - top)
+    }
+
     typealias ShiftedCells = [PDFTableCalculatedCell]
 
     func shiftCellsBy(cells: [PDFTableCalculatedCell], shiftValue: CGFloat) -> ShiftedCells {
@@ -496,16 +613,7 @@ class PDFTableObject: PDFRenderObject {
     }
 
     func createSliceObject(frame: CGRect, elements: [PDFRenderObject], minOffset: CGFloat, maxOffset: CGFloat) -> PDFSlicedObject {
-        let sliceObject = PDFSlicedObject(children: elements, frame: frame)
-        if frame.maxY > maxOffset {
-            sliceObject.frame.size.height -= sliceObject.frame.maxY - maxOffset
-            sliceObject.frame.size.height = min(sliceObject.frame.size.height, maxOffset - minOffset)
-        }
-        if frame.minY < minOffset {
-            sliceObject.frame.origin.y += minOffset - sliceObject.frame.origin.y
-            sliceObject.frame.size.height -= minOffset - sliceObject.frame.origin.y
-        }
-        return sliceObject
+        PDFSlicedObject(children: elements, frame: visibleFrame(of: frame, minOffset: minOffset, maxOffset: maxOffset))
     }
 
     /// Creates a render object for the cell background

@@ -39,7 +39,8 @@ public class PDFTable: PDFDocumentObject {
     /// Header rows will be drawn on every page
     public var showHeadersOnEveryPage: Bool = false
 
-    //// Cells should split when overlapping page
+    /// Whether a row taller than a page runs on across pages, breaking between two text lines, instead of failing
+    /// with `PDFError.tableCellTooBig`. Rows that fit a page still move whole to the next page.
     public var shouldSplitCellsOnPageBreak = false
 
     /**

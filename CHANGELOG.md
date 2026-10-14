@@ -1,5 +1,13 @@
 # Change Log
 
+## Unreleased (fork of 2.6.1, branch `fix/table-split-rows`)
+
+**Fixed bugs:**
+
+- Fixed `PDFTable.shouldSplitCellsOnPageBreak` slicing every row that reached a page bottom, also rows that fit a page: such a row now moves whole to the next page
+- Fixed split table rows cutting through text lines: a row taller than a page now breaks between two lines
+- Fixed the table outline of a page with a split row running past the footer and drawing an empty box above the repeated header on the next page
+
 ## [2.4.1](https://github.com/techprimate/TPPDF/tree/2.4.1) (2023-03-28)
 
 [Full Changelog](https://github.com/techprimate/TPPDF/compare/2.4.0...2.4.1)
