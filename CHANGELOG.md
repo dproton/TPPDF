@@ -8,6 +8,10 @@
 - Fixed split table rows cutting through text lines: a row taller than a page now breaks between two lines
 - Fixed the table outline of a page with a split row running past the footer and drawing an empty box above the repeated header on the next page
 
+**Performance:**
+
+- A table whose rows move whole to the next page is laid out in time proportional to its rows: each page break used to copy and move every remaining cell, so the time grew with rows × pages. Tables with split cells or with cells spanning rows keep the old path
+
 ## [2.4.1](https://github.com/techprimate/TPPDF/tree/2.4.1) (2023-03-28)
 
 [Full Changelog](https://github.com/techprimate/TPPDF/compare/2.4.0...2.4.1)

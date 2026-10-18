@@ -126,9 +126,10 @@ class PDFTableObject: PDFRenderObject {
         // Create render objects
         let renderObjects = try createRenderObjects(generator: generator,
                                                     container: container,
-                                                    cells: cells.reduce([], +),
+                                                    cells: cells.flatMap { $0 },
                                                     headerCells: headerCells,
-                                                    headerHeight: headerHeight)
+                                                    headerHeight: headerHeight,
+                                                    spansRows: mergeNodes.contains { row in row.contains { $0.moreRowsSpan > 0 } })
 
         // Set correct offset of generator
         let finalOffset = PDFCalculations.calculateContentOffset(for: generator, of: renderObjects.offset, in: container)
@@ -277,7 +278,8 @@ class PDFTableObject: PDFRenderObject {
         container: PDFContainer,
         cells: [PDFTableCalculatedCell],
         headerCells: [PDFTableCalculatedCell]?,
-        headerHeight: CGFloat
+        headerHeight: CGFloat,
+        spansRows: Bool
     ) throws -> (objects: [PDFLocatedRenderObject], offset: CGFloat) {
         var result: [PDFLocatedRenderObject] = []
 
@@ -286,6 +288,14 @@ class PDFTableObject: PDFRenderObject {
         var nextPageCells: [PDFTableCalculatedCell] = cells
         var pageEnd = CGPoint.null
         var headerShift = table.showHeadersOnEveryPage
+        // Rows that move whole, with no cell spanning rows, come in order and each row's cells share one bottom, so
+        // a page ends at the first cell that doesn't fit. The remaining cells are then `cells[pendingIndex...]`
+        // moved by `pendingShift`, and a page break moves only the page's own cells instead of copying every
+        // remaining cell
+        let usesPendingCells = !table.shouldSplitCellsOnPageBreak && !spansRows
+        var pendingIndex = 0
+        var pendingShift: CGFloat = 0
+        var hasMoreCells = true
 
         repeat {
             var pageStart = CGPoint.null
@@ -346,28 +356,60 @@ class PDFTableObject: PDFRenderObject {
             if !firstPage {
                 // shift the rest of the cells down by headerHeight
                 if headerShift {
-                    nextPageCells = shiftCellsBy(cells: nextPageCells, shiftValue: headerHeight)
+                    if usesPendingCells {
+                        pendingShift += headerHeight
+                    } else {
+                        nextPageCells = shiftCellsBy(cells: nextPageCells, shiftValue: headerHeight)
+                    }
                     headerShift = false
                 }
                 // add table padding around cells
-                nextPageCells = shiftCellsBy(cells: nextPageCells, shiftValue: table.margin)
+                if usesPendingCells {
+                    pendingShift += table.margin
+                } else {
+                    nextPageCells = shiftCellsBy(cells: nextPageCells, shiftValue: table.margin)
+                }
             }
 
             // The room a later page leaves for rows, under the repeated header
             let nextPageHeight = maxOffset - PDFCalculations.calculateTopMinimum(for: generator) - headerHeight - table.margin
-            let filterResult = filterCellsOnPage(
-                for: generator, items: nextPageCells,
-                minOffset: minOffset, maxOffset: maxOffset,
-                nextPageHeight: nextPageHeight,
-                shouldSplitCellsOnPageBreak: table.shouldSplitCellsOnPageBreak
-            )
-            let onPageCells = filterResult.cells
-            nextPageCells = filterResult.remainder
+            let onPageCells: [PDFTableCalculatedCell]
             // Where this page's part of the table ends; above `maxOffset` when a split row breaks between lines
-            let pageBottom = filterResult.pageBottom
+            let pageBottom: CGFloat
+            let firstRemainingCell: PDFTableCalculatedCell?
+            if usesPendingCells {
+                var fittingCells: [PDFTableCalculatedCell] = []
+                var nextPageCell: PDFTableCalculatedCell?
+                while pendingIndex < cells.count {
+                    let cell = shifted(cells[pendingIndex], by: pendingShift)
+                    guard cell.frames.cell.maxY < maxOffset else {
+                        // Move the remaining cells up so this one starts the next page
+                        pendingShift -= cell.frames.cell.minY - minOffset
+                        nextPageCell = cell
+                        break
+                    }
+                    fittingCells.append(cell)
+                    pendingIndex += 1
+                }
+                onPageCells = fittingCells
+                pageBottom = maxOffset
+                firstRemainingCell = nextPageCell
+            } else {
+                let filterResult = filterCellsOnPage(
+                    for: generator, items: nextPageCells,
+                    minOffset: minOffset, maxOffset: maxOffset,
+                    nextPageHeight: nextPageHeight,
+                    shouldSplitCellsOnPageBreak: table.shouldSplitCellsOnPageBreak
+                )
+                onPageCells = filterResult.cells
+                nextPageCells = filterResult.remainder
+                pageBottom = filterResult.pageBottom
+                firstRemainingCell = nextPageCells.first
+            }
+            hasMoreCells = firstRemainingCell != nil
             // If none of the cells fit on the current page, the algorithm will try again on the next page
             // and if it occurs again, an error should be thrown
-            if onPageCells.isEmpty && !firstPage, let firstInvalidCell = nextPageCells.first {
+            if onPageCells.isEmpty && !firstPage, let firstInvalidCell = firstRemainingCell {
                 throw PDFError.tableCellTooBig(cell: firstInvalidCell.cell)
             }
 
@@ -418,11 +460,11 @@ class PDFTableObject: PDFRenderObject {
             ))
             result += [(container, tableOutlineObject)]
             
-            if !nextPageCells.isEmpty {
+            if hasMoreCells {
                 result += try PDFPageBreakObject().calculate(generator: generator, container: container)
                 firstPage = false
             }
-        } while !nextPageCells.isEmpty
+        } while hasMoreCells
         
         return (objects: result, offset: pageEnd.y + table.margin)
     }
@@ -598,6 +640,14 @@ class PDFTableObject: PDFRenderObject {
     }
 
     typealias ShiftedCells = [PDFTableCalculatedCell]
+
+    /// `cell` moved down by `value`, its content with it
+    func shifted(_ cell: PDFTableCalculatedCell, by value: CGFloat) -> PDFTableCalculatedCell {
+        var cell = cell
+        cell.frames.cell.origin.y += value
+        cell.frames.content.origin.y += value
+        return cell
+    }
 
     func shiftCellsBy(cells: [PDFTableCalculatedCell], shiftValue: CGFloat) -> ShiftedCells {
         var shiftedCells: [PDFTableCalculatedCell] = []
